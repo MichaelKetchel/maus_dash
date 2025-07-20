@@ -142,7 +142,7 @@ class ModuleLoader:
             module_instance = module.create_module(self.event_bus)
 
             if not isinstance(module_instance, BaseModule):
-                raise TypeError(f"Module {module_name} must return a BaseModule instance")
+                raise TypeError(f"Module {module_name} must return a BaseModule instance. Got {type(module_instance)}")
 
             # Initialize the module
             await module_instance.initialize()

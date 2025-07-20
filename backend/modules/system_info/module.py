@@ -5,8 +5,8 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.module_loader import BaseModule
-from core.event_bus import EventBus
+from backend.core.module_loader import BaseModule
+from backend.core.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 

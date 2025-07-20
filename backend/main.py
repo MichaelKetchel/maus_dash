@@ -74,8 +74,10 @@ async def lifespan(app: FastAPI):
         # Start the event bus
         await event_bus.start()
 
-        # Load modules
-        await module_loader.load_modules("modules")
+        # Load modules - handle both running from backend/ and project root
+        backend_dir = Path(__file__).parent
+        modules_dir = backend_dir / "modules"
+        await module_loader.load_modules(str(modules_dir))
 
         # Start background workers
         await worker_manager.start_workers()
@@ -86,6 +88,12 @@ async def lifespan(app: FastAPI):
         logger.info("Dashboard application started successfully!")
         logger.info(f"Loaded modules: {list(module_loader.modules.keys())}")
         logger.info(f"Started workers: {list(worker_manager.workers.keys())}")
+        
+        # Debug: List all routes in the app
+        logger.info("All registered routes:")
+        for route in app.routes:
+            if hasattr(route, 'path'):
+                logger.info(f"  {getattr(route, 'methods', 'N/A')} {route.path}")
 
     except Exception as e:
         logger.error(f"Failed to start application: {e}")
@@ -121,7 +129,7 @@ async def register_core_handlers():
                 for name, module in module_loader.modules.items()
             },
             "workers": {
-                name: {"running": worker.is_running(), "last_run": worker.last_run}
+                name: {"running": worker.is_running(), "last_run": worker.last_run.isoformat()}
                 for name, worker in worker_manager.workers.items()
             },
             "connections": websocket_manager.connection_count
@@ -135,6 +143,53 @@ async def register_core_handlers():
         await websocket_manager.broadcast(data)
 
 
+# Pre-register module routes during import time
+def setup_module_routes():
+    """Setup module routes at import time"""
+    from backend.core.event_bus import EventBus
+    from backend.core.module_loader import ModuleLoader
+    import redis.asyncio as redis
+    import asyncio
+    
+    # We need to do this synchronously at import time
+    backend_dir = Path(__file__).parent
+    modules_dir = backend_dir / "modules"
+    
+    # Simple synchronous module discovery for route registration
+    if modules_dir.exists():
+        for module_dir in modules_dir.iterdir():
+            if module_dir.is_dir() and not module_dir.name.startswith('_'):
+                module_file = module_dir / "module.py"
+                if module_file.exists():
+                    try:
+                        # Import and register routes directly
+                        import importlib.util
+                        import sys
+                        
+                        spec = importlib.util.spec_from_file_location(
+                            f"modules.{module_dir.name}",
+                            module_file
+                        )
+                        if spec and spec.loader:
+                            module = importlib.util.module_from_spec(spec)
+                            sys.modules[f"modules.{module_dir.name}"] = module
+                            spec.loader.exec_module(module)
+                            
+                            if hasattr(module, 'create_module'):
+                                # Create a minimal event bus for route setup
+                                class MinimalEventBus:
+                                    def on(self, event): return lambda f: f
+                                
+                                module_instance = module.create_module(MinimalEventBus())
+                                routes = module_instance.get_routes()
+                                
+                                for router in routes:
+                                    app.include_router(router, prefix=f"/api/{module_dir.name}")
+                                    
+                                logger.info(f"Pre-registered {len(routes)} routers for module {module_dir.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to pre-register module {module_dir.name}: {e}")
+
 # Create FastAPI app
 app = FastAPI(
     title="Dashboard API",
@@ -142,6 +197,14 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+
+# Setup module routes at import time
+setup_module_routes()
+
+# Test route to verify routing works
+@app.get("/test")
+async def test_route():
+    return {"message": "Test route works"}
 
 # Add CORS middleware
 app.add_middleware(
@@ -243,23 +306,33 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket_manager.disconnect(client_id)
 
 
-# Mount static files (for serving frontend if needed)
-static_path = Path("frontend/dist")
+# Mount static files (for serving frontend if needed)  
+backend_dir = Path(__file__).parent
+static_path = backend_dir.parent / "frontend" / "dist"
 if static_path.exists():
     app.mount("/", StaticFiles(directory=static_path, html=True), name="static")
 
 
 # Dynamic route registration from modules
-@app.on_event("startup")
 async def register_module_routes():
     """Register routes from loaded modules"""
     if module_loader:
         for module_name, module in module_loader.modules.items():
             routes = module.get_routes()
-            for route in routes:
-                app.include_router(route, prefix=f"/api/{module_name}")
-            logger.info(f"Registered {len(routes)} routes for module {module_name}")
+            logger.info(f"Module {module_name} has {len(routes)} routers")
+            for i, router in enumerate(routes):
+                logger.info(f"Registering router {i} for {module_name} with {len(router.routes)} routes")
+                for route in router.routes:
+                    logger.info(f"  Route: {route.methods} {route.path}")
+                app.include_router(router, prefix=f"/api/{module_name}")
+                logger.info(f"  Included router with prefix /api/{module_name}")
+            logger.info(f"Registered {len(routes)} routers for module {module_name}")
 
+
+@app.get("/url-list")
+def get_all_urls():
+    url_list = [{"path": route.path, "name": route.name} for route in app.routes]
+    return url_list
 
 def main():
     """Main entry point"""
@@ -271,7 +344,7 @@ def main():
         "port": 8000,
         "log_level": "info",
         "reload": True,  # Set to False in production
-        "reload_dirs": ["backend"],
+        "reload_dirs": ["."],
     }
 
     logger.info(f"Starting server on {config['host']}:{config['port']}")
