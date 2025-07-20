@@ -21,24 +21,43 @@ class SystemInfoResponse(BaseModel):
 
 
 class SystemInfoModule(BaseModule):
-    """Example module that provides system information"""
+    """Enhanced system information module with full lifecycle support"""
 
     def __init__(self, event_bus: EventBus):
         super().__init__("system_info", event_bus)
         self.router = APIRouter()
         self.start_time = datetime.utcnow()
+        self._metrics_task = None
         self._setup_routes()
         self._setup_event_handlers()
 
+    async def pre_initialize(self):
+        """Pre-initialization setup"""
+        logger.info("Pre-initializing SystemInfo module")
+        
     async def initialize(self):
         """Initialize the module"""
         logger.info("Initializing SystemInfo module")
+
+        # Start background metrics collection if psutil is available
+        try:
+            import psutil
+            self._metrics_task = asyncio.create_task(self._metrics_loop())
+            self.schedule_cleanup_task(self._metrics_task)
+            logger.info("Started background metrics collection")
+        except ImportError:
+            logger.warning("psutil not available - metrics collection disabled")
 
         # Example of module initialization
         await self.event_bus.emit("system_info.initialized", {
             "module": self.name,
             "start_time": self.start_time.isoformat()
         })
+        
+    async def post_initialize(self):
+        """Post-initialization setup"""
+        logger.info("Post-initializing SystemInfo module")
+        # Module is now fully ready
 
     def _setup_routes(self):
         """Setup FastAPI routes for this module"""
@@ -136,7 +155,7 @@ class SystemInfoModule(BaseModule):
             """Handle status requests"""
             status = {
                 "module": self.name,
-                "initialized": self.is_initialized,
+                "state": self.state.value,
                 "uptime": (datetime.utcnow() - self.start_time).total_seconds(),
                 "routes": len(self.get_routes()),
                 "timestamp": datetime.utcnow().isoformat()
@@ -148,15 +167,74 @@ class SystemInfoModule(BaseModule):
         """Return FastAPI routes for this module"""
         return [self.router]
 
+    async def pre_cleanup(self):
+        """Pre-cleanup hook"""
+        logger.info("Pre-cleanup SystemInfo module")
+        
     async def cleanup(self):
         """Cleanup module resources"""
         logger.info("Cleaning up SystemInfo module")
+        
+        # Cancel metrics task
+        if self._metrics_task and not self._metrics_task.done():
+            self._metrics_task.cancel()
+            try:
+                await self._metrics_task
+            except asyncio.CancelledError:
+                pass
+
+        # Call parent cleanup for standard cleanup tasks
+        await super().cleanup()
 
         # Emit cleanup event
         await self.event_bus.emit("system_info.cleanup", {
             "module": self.name,
             "cleanup_at": datetime.utcnow().isoformat()
         })
+        
+    async def post_cleanup(self):
+        """Post-cleanup hook"""
+        logger.info("Post-cleanup SystemInfo module")
+
+
+    async def _metrics_loop(self):
+        """Background metrics collection loop"""
+        try:
+            import psutil
+            while True:
+                try:
+                    metrics = {
+                        "cpu_percent": psutil.cpu_percent(interval=1),
+                        "memory": {
+                            "total": psutil.virtual_memory().total,
+                            "used": psutil.virtual_memory().used,
+                            "percent": psutil.virtual_memory().percent
+                        },
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    
+                    # Add disk info (cross-platform)
+                    try:
+                        disk = psutil.disk_usage('/' if hasattr(psutil, 'disk_usage') else 'C:\\')
+                        metrics["disk"] = {
+                            "total": disk.total,
+                            "used": disk.used,
+                            "percent": (disk.used / disk.total) * 100
+                        }
+                    except Exception:
+                        pass  # Skip disk metrics if unavailable
+                    
+                    await self.event_bus.emit("system.metrics", metrics)
+                    await asyncio.sleep(5)  # Update every 5 seconds
+                    
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in metrics loop: {e}")
+                    await asyncio.sleep(10)  # Wait longer on error
+                    
+        except ImportError:
+            pass  # psutil not available
 
 
 def create_module(event_bus: EventBus) -> BaseModule:

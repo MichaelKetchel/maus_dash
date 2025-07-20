@@ -36,6 +36,7 @@ backend = "backend.main:main"
 dev-dependencies = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "httpx>=0.24.0",
     "black>=23.0.0",
     "ruff>=0.0.290",
     "pyinstaller>=6.14.2",

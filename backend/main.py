@@ -107,6 +107,14 @@ async def lifespan(app: FastAPI):
     if worker_manager:
         await worker_manager.stop_workers()
 
+    if module_loader:
+        logger.info("Unloading all modules...")
+        try:
+            await module_loader.unload_all_modules(force=True)
+            logger.info("All modules unloaded successfully")
+        except Exception as e:
+            logger.error(f"Error unloading modules: {e}")
+
     if event_bus:
         await event_bus.stop()
 
@@ -248,6 +256,91 @@ async def get_status():
         },
         connections=websocket_manager.connection_count
     )
+
+
+# Enhanced Module Management API Endpoints
+@app.get("/api/modules")
+async def get_modules():
+    """Get list of all modules with enhanced information"""
+    if module_loader:
+        return {
+            "modules": module_loader.get_module_list(),
+            "stats": await module_loader.get_stats()
+        }
+    return {"modules": [], "stats": {}}
+
+@app.post("/api/modules/{module_name}/reload")
+async def reload_module(module_name: str, force: bool = False):
+    """Reload a specific module"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    try:
+        await module_loader.reload_module(module_name, force=force)
+        return {"status": "success", "message": f"Module {module_name} reloaded"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/modules/{module_name}/unload")
+async def unload_module(module_name: str, force: bool = False):
+    """Unload a specific module"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    try:
+        await module_loader.unload_module(module_name, force=force)
+        return {"status": "success", "message": f"Module {module_name} unloaded"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/modules/reload-all")
+async def reload_all_modules(force: bool = False):
+    """Reload all modules"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    try:
+        results = await module_loader.reload_all_modules(force=force)
+        return {"status": "success", "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/modules/auto-reload")
+async def auto_reload_modules():
+    """Auto-reload modules with file changes"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    try:
+        results = await module_loader.auto_reload_changed_modules()
+        return {"status": "success", "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/modules/changes")
+async def check_module_changes():
+    """Check for module file changes"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    changes = module_loader.check_file_changes()
+    return {"changes": changes, "changed_count": len([c for c in changes.values() if c])}
+
+@app.get("/api/modules/dependency-graph")
+async def get_dependency_graph():
+    """Get module dependency graph"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    return {"graph": module_loader.get_module_dependency_graph()}
+
+@app.get("/api/modules/routes")
+async def get_module_routes():
+    """Get all routes provided by modules"""
+    if not module_loader:
+        raise HTTPException(status_code=503, detail="Module loader not available")
+    
+    return {"routes": module_loader.list_module_routes()}
 
 
 # WebSocket endpoint
