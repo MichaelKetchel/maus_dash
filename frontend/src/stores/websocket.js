@@ -56,11 +56,18 @@ export const useWebSocketStore = defineStore('websocket', () => {
     }
   }
 
-  const send = (type, payload = {}, target = null) => {
-    const message = {
-      type,
-      payload,
-      ...(target && { target })
+  const send = (messageOrType, payload = {}, target = null) => {
+    let message
+    
+    // Support both object and parameter formats
+    if (typeof messageOrType === 'object') {
+      message = messageOrType
+    } else {
+      message = {
+        type: messageOrType,
+        payload,
+        ...(target && { target })
+      }
     }
 
     if (isConnected.value && ws.value.readyState === WebSocket.OPEN) {
@@ -170,16 +177,33 @@ export const useWebSocketStore = defineStore('websocket', () => {
   }
 
   const handleEvent = (eventType, data) => {
-    const handlers = eventHandlers.value.get(eventType)
-    if (handlers) {
-      handlers.forEach(handler => {
+    // Handle exact matches
+    const exactHandlers = eventHandlers.value.get(eventType)
+    if (exactHandlers) {
+      exactHandlers.forEach(handler => {
         try {
-          handler(data)
+          handler(data, eventType)
         } catch (error) {
           console.error(`Error in event handler for ${eventType}:`, error)
         }
       })
     }
+    
+    // Handle wildcard patterns (e.g., "module.*")
+    eventHandlers.value.forEach((handlers, pattern) => {
+      if (pattern.includes('*')) {
+        const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$')
+        if (regex.test(eventType)) {
+          handlers.forEach(handler => {
+            try {
+              handler(data, eventType)
+            } catch (error) {
+              console.error(`Error in wildcard event handler for ${pattern}:`, error)
+            }
+          })
+        }
+      }
+    })
   }
 
   const handleClose = (event) => {

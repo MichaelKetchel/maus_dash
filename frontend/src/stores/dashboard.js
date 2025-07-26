@@ -1,12 +1,14 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useWebSocketStore } from './websocket'
+import moduleService from '@/services/moduleService'
 
 export const useDashboardStore = defineStore('dashboard', () => {
-  // State
+  // Enhanced state
   const systemInfo = ref({})
   const systemMetrics = ref({})
-  const modules = ref({})
+  const modules = ref([])  // Now array for enhanced module info
+  const moduleStats = ref({})
   const workers = ref({})
   const isLoading = ref(false)
   const error = ref(null)
@@ -23,7 +25,16 @@ export const useDashboardStore = defineStore('dashboard', () => {
   })
 
   const activeModulesCount = computed(() => {
-    return Object.values(modules.value).filter(module => module.loaded).length
+    return modules.value.filter(module => module.state === 'ready').length
+  })
+  
+  const modulesByState = computed(() => {
+    const byState = {}
+    modules.value.forEach(module => {
+      if (!byState[module.state]) byState[module.state] = []
+      byState[module.state].push(module)
+    })
+    return byState
   })
 
   const runningWorkersCount = computed(() => {
@@ -111,14 +122,18 @@ export const useDashboardStore = defineStore('dashboard', () => {
       isLoading.value = true
       error.value = null
 
-      // Fetch via REST API
-      const response = await fetch('/api/status')
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-      }
+      // Fetch enhanced module data and system status
+      const [moduleResponse, statusResponse] = await Promise.all([
+        moduleService.getModules(),
+        fetch('/api/status').then(r => r.ok ? r.json() : { status: 'error' })
+      ])
 
-      const data = await response.json()
-      updateSystemStatus(data)
+      // Update module state
+      modules.value = moduleResponse.modules || []
+      moduleStats.value = moduleResponse.stats || {}
+      
+      // Update other system data
+      updateSystemStatus(statusResponse)
 
     } catch (err) {
       console.error('Failed to fetch system status:', err)
