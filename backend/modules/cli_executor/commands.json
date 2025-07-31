@@ -1,0 +1,14 @@
+[
+  {
+    "name": "reload_hyprland",
+    "cmds": [
+      "hyprctl reload"
+    ]
+  },
+  {
+    "name": "screenshot",
+    "cmds": [
+      "~/.config/hypr/scripts/screenshot_grimblast_fuzzel.sh"
+    ]
+  }
+]
