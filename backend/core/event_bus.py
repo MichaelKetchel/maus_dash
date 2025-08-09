@@ -1,12 +1,19 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Dict, Callable, Any, Optional, List
 from dataclasses import dataclass, field
 from functools import wraps
-import redis.asyncio as redis
 import uuid
 from datetime import datetime
+
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 
 logger = logging.getLogger(__name__)
 
@@ -23,32 +30,60 @@ class EventHandler:
 
 class EventBus:
     """
-    Redis-backed event bus for inter-component communication
-    Supports both local and distributed events
+    Event bus for inter-component communication
+    Supports both Redis-backed distributed events and in-memory local events
+    Falls back to in-memory mode if Redis is unavailable or disabled
     """
 
-    def __init__(self, redis_client: redis.Redis):
-        self.redis = redis_client
+    def __init__(self, redis_client: Optional['redis.Redis'] = None):
+        # Check if Redis should be enabled via environment variable
+        use_redis = os.getenv('USE_REDIS', '').lower() in ('true', '1', 'yes', 'on')
+        
+        self.redis = redis_client if redis_client and REDIS_AVAILABLE and use_redis else None
         self.handlers: Dict[str, List[EventHandler]] = {}
         self.local_handlers: Dict[str, List[EventHandler]] = {}
         self.is_running = False
         self.subscriber_task: Optional[asyncio.Task] = None
         self.pubsub = None
+        
+        # Log the mode we're operating in
+        if self.redis:
+            logger.info("EventBus initialized with Redis support")
+        else:
+            mode_reason = []
+            if not REDIS_AVAILABLE:
+                mode_reason.append("Redis not available")
+            if not use_redis:
+                mode_reason.append("USE_REDIS not set")
+            if not redis_client:
+                mode_reason.append("no Redis client provided")
+            
+            reason = " (" + ", ".join(mode_reason) + ")" if mode_reason else ""
+            logger.info(f"EventBus initialized in local-only mode{reason}")
 
     async def start(self):
-        """Start the event bus and Redis subscriber"""
+        """Start the event bus and Redis subscriber if available"""
         if self.is_running:
             return
 
         self.is_running = True
-        self.pubsub = self.redis.pubsub()
-
-        # Subscribe to all dashboard events
-        await self.pubsub.subscribe("dashboard:*")
-
-        # Start the subscriber task
-        self.subscriber_task = asyncio.create_task(self._subscriber_loop())
-        logger.info("Event bus started")
+        
+        # Only start Redis subscriber if Redis is available
+        if self.redis:
+            try:
+                self.pubsub = self.redis.pubsub()
+                # Subscribe to all dashboard events
+                await self.pubsub.subscribe("dashboard:*")
+                # Start the subscriber task
+                self.subscriber_task = asyncio.create_task(self._subscriber_loop())
+                logger.info("Event bus started with Redis")
+            except Exception as e:
+                logger.warning(f"Failed to start Redis subscriber, falling back to local-only mode: {e}")
+                self.redis = None
+                self.pubsub = None
+        
+        if not self.redis:
+            logger.info("Event bus started in local-only mode")
 
     async def stop(self):
         """Stop the event bus"""
@@ -65,8 +100,11 @@ class EventBus:
                 pass
 
         if self.pubsub:
-            await self.pubsub.unsubscribe()
-            await self.pubsub.close()
+            try:
+                await self.pubsub.unsubscribe()
+                await self.pubsub.close()
+            except Exception as e:
+                logger.warning(f"Error closing Redis pubsub: {e}")
 
         logger.info("Event bus stopped")
 
@@ -164,8 +202,8 @@ class EventBus:
         # Handle local events first
         await self._handle_event(event_type, event_data, local_only=True)
 
-        # Publish to Redis if not local_only
-        if not local_only and self.is_running:
+        # Publish to Redis if not local_only and Redis is available
+        if not local_only and self.is_running and self.redis:
             try:
                 await self.redis.publish(
                     f"dashboard:{event_type}",
@@ -265,11 +303,19 @@ class EventBus:
 
     async def get_stats(self) -> Dict[str, Any]:
         """Get event bus statistics"""
+        redis_connected = False
+        if self.redis:
+            try:
+                redis_connected = await self.redis.ping()
+            except Exception:
+                redis_connected = False
+                
         return {
             'running': self.is_running,
+            'redis_enabled': self.redis is not None,
+            'redis_connected': redis_connected,
             'local_handlers': {
                 pattern: len(handlers)
                 for pattern, handlers in self.local_handlers.items()
             },
-            'redis_connected': self.redis and await self.redis.ping(),
         }

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
 import json
@@ -8,8 +9,14 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import redis.asyncio as redis
 from pydantic import BaseModel, Field
+
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 
 from backend.core.event_bus import EventBus
 from backend.core.websocket_manager import WebSocketManager
@@ -53,17 +60,28 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Dashboard Application...")
 
     try:
-        # Initialize Redis connection
-        redis_client = redis.Redis(
-            host='localhost',
-            port=6379,
-            decode_responses=True,
-            retry_on_timeout=True
-        )
-
-        # Test Redis connection
-        await redis_client.ping()
-        logger.info("Redis connection established")
+        # Initialize Redis connection if available and enabled
+        redis_client = None
+        use_redis = os.getenv('USE_REDIS', '').lower() in ('true', '1', 'yes', 'on')
+        
+        if REDIS_AVAILABLE and use_redis:
+            try:
+                redis_client = redis.Redis(
+                    host='localhost',
+                    port=6379,
+                    decode_responses=True,
+                    retry_on_timeout=True
+                )
+                # Test Redis connection
+                await redis_client.ping()
+                logger.info("Redis connection established")
+            except Exception as e:
+                logger.warning(f"Failed to connect to Redis, falling back to local-only mode: {e}")
+                redis_client = None
+        elif not use_redis:
+            logger.info("Redis disabled via USE_REDIS environment variable")
+        elif not REDIS_AVAILABLE:
+            logger.info("Redis not available (import failed)")
 
         # Initialize core components
         event_bus = EventBus(redis_client)
@@ -118,8 +136,12 @@ async def lifespan(app: FastAPI):
     if event_bus:
         await event_bus.stop()
 
-    if redis_client:
-        await redis_client.close()
+    # Close Redis client if it exists
+    try:
+        if 'redis_client' in locals() and redis_client:
+            await redis_client.close()
+    except Exception as e:
+        logger.warning(f"Error closing Redis client: {e}")
 
     logger.info("Dashboard application stopped")
 
@@ -156,7 +178,6 @@ def setup_module_routes():
     """Setup module routes at import time"""
     from backend.core.event_bus import EventBus
     from backend.core.module_loader import ModuleLoader
-    import redis.asyncio as redis
     import asyncio
     
     # We need to do this synchronously at import time
