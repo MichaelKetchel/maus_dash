@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Any, List
+import uuid
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -33,26 +34,216 @@ class CLICommand(BaseModel):
     name: str
     cmds: List[str]
 
-class CLICommandResponse(CLICommand):
+class CLICommandResponse(BaseModel):
     """Represents a CLI command response"""
+    execution_id: str
     name: str
     cmd: str
-    code: int
-    stdout: str
-    stderr: str
+    code: Optional[int] = None
+    stdout: str = ""
+    stderr: str = ""
+
+class CommandExecutionRequest(BaseModel):
+    """Request to execute a command"""
+    stream_output: bool = False
+    timeout: int = 30
+
+
+class AsyncCommandExecutor:
+    """Handles async execution of CLI commands with real-time communication"""
+    
+    def __init__(self, event_bus: EventBus):
+        self.event_bus = event_bus
+        self.running_processes: Dict[str, asyncio.subprocess.Process] = {}
+    
+    async def execute_command(
+        self, 
+        command: CLICommand, 
+        execution_id: str,
+        stream_output: bool = False,
+        timeout: int = 30
+    ) -> CLICommandResponse:
+        """Execute a command asynchronously with real-time updates"""
+        
+        if not command.cmds:
+            raise ValueError("No commands defined")
+        
+        cmd_string = command.cmds[0]  # Execute first command
+        
+        # Notify start
+        await self.event_bus.emit("websocket.broadcast", {
+            "message": {
+                "type": "command_started",
+                "execution_id": execution_id,
+                "command": command.name,
+                "cmd": cmd_string
+            }
+        })
+        
+        try:
+            # Create subprocess
+            process = await asyncio.create_subprocess_shell(
+                cmd_string,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if stream_output else None
+            )
+            
+            self.running_processes[execution_id] = process
+            
+            stdout_data = ""
+            stderr_data = ""
+            
+            if stream_output:
+                # Stream output in real-time
+                stdout_data, stderr_data = await self._stream_output(
+                    process, execution_id, timeout
+                )
+            else:
+                # Wait for completion
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout
+                    )
+                    stdout_data = stdout_bytes.decode() if stdout_bytes else ""
+                    stderr_data = stderr_bytes.decode() if stderr_bytes else ""
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+                    raise
+            
+            # Clean up
+            self.running_processes.pop(execution_id, None)
+            
+            response = CLICommandResponse(
+                execution_id=execution_id,
+                name=command.name,
+                cmd=cmd_string,
+                code=process.returncode,
+                stdout=stdout_data,
+                stderr=stderr_data
+            )
+            
+            # Notify completion
+            await self.event_bus.emit("websocket.broadcast", {
+                "message": {
+                    "type": "command_completed",
+                    "execution_id": execution_id,
+                    "command": command.name,
+                    "exit_code": process.returncode,
+                    "success": process.returncode == 0
+                }
+            })
+            
+            return response
+            
+        except Exception as e:
+            # Clean up and notify error
+            self.running_processes.pop(execution_id, None)
+            
+            await self.event_bus.emit("websocket.broadcast", {
+                "message": {
+                    "type": "command_error",
+                    "execution_id": execution_id,
+                    "command": command.name,
+                    "error": str(e)
+                }
+            })
+            
+            raise
+    
+    async def _stream_output(
+        self, 
+        process: asyncio.subprocess.Process, 
+        execution_id: str, 
+        timeout: int
+    ) -> tuple[str, str]:
+        """Stream stdout/stderr in real-time"""
+        stdout_data = ""
+        stderr_data = ""
+        
+        async def read_stream(stream, stream_name: str):
+            nonlocal stdout_data, stderr_data
+            data = ""
+            
+            while True:
+                try:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    
+                    line_text = line.decode()
+                    data += line_text
+                    
+                    if stream_name == "stdout":
+                        stdout_data += line_text
+                    else:
+                        stderr_data += line_text
+                    
+                    # Send real-time output
+                    await self.event_bus.emit("websocket.broadcast", {
+                        "message": {
+                            "type": "command_output",
+                            "execution_id": execution_id,
+                            "stream": stream_name,
+                            "data": line_text.rstrip('\n\r')
+                        }
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error reading {stream_name}: {e}")
+                    break
+            
+            return data
+        
+        try:
+            # Read both streams concurrently
+            await asyncio.wait_for(
+                asyncio.gather(
+                    read_stream(process.stdout, "stdout"),
+                    read_stream(process.stderr, "stderr"),
+                    process.wait()
+                ),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise
+        
+        return stdout_data, stderr_data
+    
+    async def cancel_command(self, execution_id: str) -> bool:
+        """Cancel a running command"""
+        if execution_id in self.running_processes:
+            process = self.running_processes[execution_id]
+            process.kill()
+            await process.wait()
+            self.running_processes.pop(execution_id, None)
+            
+            await self.event_bus.emit("websocket.broadcast", {
+                "message": {
+                    "type": "command_cancelled",
+                    "execution_id": execution_id
+                }
+            })
+            
+            return True
+        return False
 
 
 class CLIExecutorModule(BaseModule):
-    """Enhanced system information module with full lifecycle support"""
+    """CLI Executor module with async command execution and real-time communication"""
 
     def __init__(self, event_bus: EventBus):
         super().__init__("cli_executor", event_bus)
         self.router = APIRouter()
         self.start_time = datetime.utcnow()
+        self.available_commands: dict[str, CLICommand] = {}
+        self.executor = AsyncCommandExecutor(event_bus)
+        
         self._setup_routes()
         self._setup_event_handlers()
-
-        self.available_commands: dict[str, CLICommand] = {}
 
     async def pre_initialize(self):
         """Pre-initialization setup"""
@@ -93,11 +284,67 @@ class CLIExecutorModule(BaseModule):
 
     def _setup_routes(self):
         """Setup FastAPI routes for this module"""
-
-        for command in self.available_commands.values():
-
-            if " " in command.name:
-                logger.error("Command name contains spaces, which are not URL safe.")
+        
+        @self.router.get("/commands")
+        async def list_commands():
+            """List all available CLI commands"""
+            return {
+                "commands": [
+                    {
+                        "name": cmd.name,
+                        "cmds": cmd.cmds,
+                        "url_safe": is_url_safe(cmd.name)
+                    }
+                    for cmd in self.available_commands.values()
+                ]
+            }
+        
+        @self.router.post("/execute/{command_name}", response_model=CLICommandResponse)
+        async def execute_command(
+            command_name: str,
+            request: CommandExecutionRequest = CommandExecutionRequest()
+        ):
+            """Execute a CLI command by name"""
+            if command_name not in self.available_commands:
+                raise HTTPException(status_code=404, detail=f"Command '{command_name}' not found")
+            
+            if not is_url_safe(command_name):
+                raise HTTPException(status_code=400, detail=f"Command name '{command_name}' is not URL safe")
+            
+            command = self.available_commands[command_name]
+            execution_id = str(uuid.uuid4())
+            
+            try:
+                # Execute command asynchronously
+                result = await self.executor.execute_command(
+                    command=command,
+                    execution_id=execution_id,
+                    stream_output=request.stream_output,
+                    timeout=request.timeout
+                )
+                return result
+                
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=408, detail="Command execution timed out")
+            except Exception as e:
+                logger.error(f"Error executing command '{command_name}': {e}")
+                raise HTTPException(status_code=500, detail=f"Command execution failed: {str(e)}")
+        
+        @self.router.post("/cancel/{execution_id}")
+        async def cancel_command(execution_id: str):
+            """Cancel a running command by execution ID"""
+            cancelled = await self.executor.cancel_command(execution_id)
+            if cancelled:
+                return {"status": "cancelled", "execution_id": execution_id}
+            else:
+                raise HTTPException(status_code=404, detail=f"Command execution '{execution_id}' not found")
+        
+        @self.router.get("/running")
+        async def list_running_commands():
+            """List currently running commands"""
+            return {
+                "running_commands": list(self.executor.running_processes.keys())
+            }
 
 
 
@@ -105,44 +352,25 @@ class CLIExecutorModule(BaseModule):
     def _setup_event_handlers(self):
         """Setup event handlers for this module"""
 
-        @self.event_bus.on(f"{self.name}.refresh_requested")
-        async def handle_refresh_request(data: Dict[str, Any]):
-            """Handle refresh requests"""
-            logger.info("System info refresh requested")
-
-            # Simulate getting fresh data
-            await asyncio.sleep(0.1)
-
-            # Emit updated system info
-            await self.event_bus.emit(f"{self.name}.updated", {
-                "module": self.name,
-                "updated_at": datetime.utcnow().isoformat(),
-                "uptime": (datetime.utcnow() - self.start_time).total_seconds()
-            })
-
-        @self.event_bus.on("system.metrics")
-        async def handle_system_metrics(data: Dict[str, Any]):
-            """Handle system metrics from worker"""
-            # Forward metrics to WebSocket clients
-            await self.event_bus.emit("websocket.broadcast", {
-                "message": {
-                    "type": "system_metrics",
-                    "payload": data
-                }
-            })
-
-        @self.event_bus.on(f"{self.name}.get_status")
-        async def handle_status_request(data: Dict[str, Any]):
-            """Handle status requests"""
-            status = {
-                "module": self.name,
-                "state": self.state.value,
-                "uptime": (datetime.utcnow() - self.start_time).total_seconds(),
-                "routes": len(self.get_routes()),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-            await self.event_bus.emit(f"{self.name}.status_response", status)
+        @self.event_bus.on(f"{self.name}.send_input")
+        async def handle_send_input(data: Dict[str, Any]):
+            """Handle stdin input for running commands"""
+            execution_id = data.get("execution_id")
+            input_data = data.get("input", "")
+            
+            if execution_id in self.executor.running_processes:
+                process = self.executor.running_processes[execution_id]
+                if process.stdin:
+                    try:
+                        process.stdin.write(f"{input_data}\n".encode())
+                        await process.stdin.drain()
+                        logger.info(f"Sent input to command {execution_id}: {input_data}")
+                    except Exception as e:
+                        logger.error(f"Error sending input to command {execution_id}: {e}")
+                else:
+                    logger.warning(f"Command {execution_id} does not accept input")
+            else:
+                logger.warning(f"Command {execution_id} not found or not running")
 
     def get_routes(self) -> List[APIRouter]:
         """Return FastAPI routes for this module"""
@@ -156,13 +384,9 @@ class CLIExecutorModule(BaseModule):
         """Cleanup module resources"""
         logger.info(f"Cleaning up {self.__name__}")
         
-        # Cancel metrics task
-        if self._metrics_task and not self._metrics_task.done():
-            self._metrics_task.cancel()
-            try:
-                await self._metrics_task
-            except asyncio.CancelledError:
-                pass
+        # Cancel any running commands
+        for execution_id in list(self.executor.running_processes.keys()):
+            await self.executor.cancel_command(execution_id)
 
         # Call parent cleanup for standard cleanup tasks
         await super().cleanup()
@@ -176,46 +400,6 @@ class CLIExecutorModule(BaseModule):
     async def post_cleanup(self):
         """Post-cleanup hook"""
         logger.info(f"Post-cleanup {self.__name__}")
-
-
-    async def _metrics_loop(self):
-        """Background metrics collection loop"""
-        try:
-            import psutil
-            while True:
-                try:
-                    metrics = {
-                        "cpu_percent": psutil.cpu_percent(interval=1),
-                        "memory": {
-                            "total": psutil.virtual_memory().total,
-                            "used": psutil.virtual_memory().used,
-                            "percent": psutil.virtual_memory().percent
-                        },
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                    
-                    # Add disk info (cross-platform)
-                    try:
-                        disk = psutil.disk_usage('/' if hasattr(psutil, 'disk_usage') else 'C:\\')
-                        metrics["disk"] = {
-                            "total": disk.total,
-                            "used": disk.used,
-                            "percent": (disk.used / disk.total) * 100
-                        }
-                    except Exception:
-                        pass  # Skip disk metrics if unavailable
-                    
-                    await self.event_bus.emit("system.metrics", metrics)
-                    await asyncio.sleep(5)  # Update every 5 seconds
-                    
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Error in metrics loop: {e}")
-                    await asyncio.sleep(10)  # Wait longer on error
-                    
-        except ImportError:
-            pass  # psutil not available
 
 
 def create_module(event_bus: EventBus) -> BaseModule:

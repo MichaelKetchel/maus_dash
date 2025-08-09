@@ -3,4 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="uv (maus_dash)" />
   </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="uv (maus_dash)" project-jdk-type="Python SDK" />
 </project>
